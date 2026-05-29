@@ -34,6 +34,19 @@ The findings table on each sheet has these columns:
 
 Add a 3–4 row summary header above the table: title, run timestamp, total findings, breakdown by confidence tier. If any required non-core columns were missing (see "Header resolution" below), add a banner row listing the skipped checks.
 
+## Franken-records — read before running date/title/cross-copy checks
+
+A `Record` value normally derives from a formula (Label + Prefix + Number + Suffix). But when the `Record` field contains **two record names separated by a slash** (e.g. `Film 362/Rex 10049`, `Film 293/Rex 9788`), it is a **Franken-record**: one *side* of one record paired with one *side* of another, glued into a single row. Typically `Side A` belongs to the first named record and `Side B` to the second.
+
+Because the two sides come from **different records**, they can have very little to do with each other: their recording dates need not be close, the catalog numbers are unrelated, and the two halves come from different releases/sessions. This is intentional, not a data-entry error.
+
+**Detection**: the `Record` cell holds a literal string (not a formula) containing a `/` that separates two `Label …Number` tokens. (Contrast with a `/` inside a single title or artist field.) A helper `isFrankenRecord(recordValue)` tests for this.
+
+**Consequences for checks** — when a row is a Franken-record:
+- **Side A vs Side B recording-year gap**: do NOT flag. The two sides are from different records, so any gap is expected.
+- **Title cross-copy mismatch**: the Side A title belongs to the first record and the Side B title to the second, so each side belongs to a *different* catalog identity than the row's combined key implies. Suppress/demote any title mismatch that arises from grouping a Franken-record's side against another disc's side — they are not really copies of the same record.
+- **Cross-copy hyperlink mismatch / catalog-number grouping**: a Franken-record sharing one half's Label+Number with another record is a coincidental key collision, not a second copy. Demote any resulting finding to `Worth a look` and note the Franken-record cause in the Reason.
+
 ## Implementation environment
 
 **Do everything in `execute_office_js`.** The `code_execution` Python sandbox does NOT have Excel tool functions in this workbook — calling `get_range_as_csv` from Python returns `NameError`. All data reads, all checks (including Levenshtein), and all writes happen in JavaScript via `execute_office_js`.
@@ -129,9 +142,9 @@ Headers that exist in the workbook but the skill does not need (do NOT add looku
 
 ### Step 1 — Resolve headers, then read both tables and lookups in one `execute_office_js` call
 
-For each source sheet (`Record Collection`, last row 2520; `No Longer in Collection`, last row 190):
+For each source sheet (`Record Collection`, last row ~2520; `No Longer in Collection`, last row ~190):
 - Read row 1, build the `cols` map (per "Header resolution" above), apply the core/optional logic. If a core column is missing on either sheet, abort and report.
-- Load `A1:{lastColLetter}{lastRow}` values, where `{lastColLetter}` is computed from the actual width of row 1 (not hard-coded).
+- Load `A1:{lastColLetter}{lastRow}` values, where `{lastColLetter}` is computed from the actual width of row 1 (not hard-coded), and `{lastRow}` from the used range (not hard-coded).
 - For each hyperlink column that resolved (`DAHR A`, `DAHR B`, `Discogs`, `45cat`), call `getCellProperties({address: true, hyperlink: true})` on that column's range using its resolved letter. Read the URL as `cell.hyperlink && cell.hyperlink.address` (singular — see "Implementation environment" above).
 
 Also load:
@@ -161,6 +174,8 @@ Color-code Confidence column via **conditional formatting** on the whole column 
 
 Freeze the top header rows. Autofit columns, then cap widths: Reason = 320, Record = 180, Value = 200.
 
+Note: Excel sheet names have a **31-character limit**. `Audit YYYY-MM-DD HHMM` is 21 chars (fine), but any suffixed variant (e.g. a second sheet) must stay ≤ 31 — use a short suffix like `Audit YYYY-MM-DD HHMM Links`, not `… Hyperlinks`.
+
 ### Step 4 — Reply concisely
 
 Short paragraph: total, breakdown by confidence, citation link to new sheet, top-issue counts, and a note if any checks were skipped. Don't paste findings into chat.
@@ -176,6 +191,8 @@ The date columns (`Side A Date`, `Side B Date`, `Date Acquired`, `Sold On`) mix 
 **Jan 1 of year Y is ALSO an "imprecise year" marker** — when the user enters `2022` Excel may store it as serial 44562 (= 2022-01-01). Treat any precise Jan 1 the same as a year-only value for the purpose of comparison against more precise dates.
 
 **Never** flag two dates as inconsistent when one is imprecise (year-only OR Jan 1) and the years are equal — even if one side is a precise mid-year date. "Bought Aug 23 2021, sold sometime in 2021" is logically consistent.
+
+**Franken-records** (see "Franken-records" section above): when the `Record` field is two slash-separated records glued together, the Side A and Side B dates belong to different records and may be years apart legitimately — do not flag the gap.
 
 ## Checks
 
@@ -207,6 +224,7 @@ Every check below names the columns it needs by `cols.*` key. If any required co
   - In the future → `Definite error`.
   - Compared to `Date Acquired`: see "Date parsing" above. Only flag when **logically impossible**. If either side is imprecise (year-only OR Jan 1), compare years and only flag if `Sold On` year < `Date Acquired` year. If both are precise dates, flag if `Sold On.date < Date Acquired.date`.
 - **Side A vs Side B recording-year gap** (needs both `cols.SideADate` and `cols.SideBDate`):
+  - **Skip entirely if the row is a Franken-record** (Record field is two slash-separated records — see "Franken-records" section). The two sides come from different records and an arbitrary gap is expected.
   - ≤ 2 years → no flag.
   - 2–5 years → `Worth a look`.
   - 5–10 years → `Probable error`.
@@ -267,6 +285,8 @@ For each artist NAME (parsed via the role tokenizer, then stripping role segment
    - Both (A) and (B) must hold. → `Probable error` (issue: `Artist near-duplicate`).
 3. Names shorter than 4 collapsed characters: skip.
 
+Known false positive: an artist spelling annotated with `[sic]` is a deliberate user note, not a typo — the user has already flagged it.
+
 ### Title cross-copy mismatch
 
 Goal: detect title typos using high-signal cross-copy comparison (a typo of "Puttin' on the Ritz" on copy 1 vs the correct spelling on copy 2 of the SAME record).
@@ -276,7 +296,8 @@ Goal: detect title typos using high-signal cross-copy comparison (a typo of "Put
    - Collapse each title to lowercase letters+digits (so `"Puttin' on the Ritz"` and `"Puttin' On the Ritz"` collapse the same).
    - If two copies have different collapsed forms → `Probable error` (issue: `Title cross-copy mismatch`).
    - Flag the minority spelling(s); suggest the majority as the fix.
-3. The old singleton-vs-common Levenshtein title check is removed — it produced too many false positives across legitimate different songs.
+3. **Franken-record collisions**: a Franken-record (Record field = two slash-separated records) pairs one side from each of two different records. Its Side A and Side B titles therefore belong to *different* catalog identities than the row's combined Label+Number key. When a grouped "copies" set includes a Franken-record — or two records collide on a key only because one is a Franken-record half — the differing titles are NOT a typo between copies; they are titles from genuinely different records. Demote such findings to `Worth a look` and note "Franken-record: sides come from different records" in the Reason.
+4. The old singleton-vs-common Levenshtein title check is removed — it produced too many false positives across legitimate different songs.
 
 ### Vendor / Provenance namespace
 
@@ -285,7 +306,7 @@ Needs both `cols.Vendor` and `cols.Provenance`. Treat them as ONE combined names
 1. Pool unique values from both columns across both tables; compute combined frequency.
 2. Suppress pairs differing only by a trailing `?` (uncertainty marker — `Henry Parsons` vs `Henry Parsons?` is intentional).
 3. Pairs differing only by case/punctuation (collapsed forms match): → `Definite error` (issue: `Vendor/Provenance case/punct dup`).
-4. Pairs with Levenshtein ≤ 2 on collapsed forms where one appears ≥ 3× and the other appears ≤ 2×: → `Probable error` (issue: `Vendor/Provenance near-dup`). Report the less-frequent value with the canonical as suggested fix.
+4. Pairs with Levenshtein ≤ 2 on collapsed forms where one appears ≥ 3× and the other appears ≤ 2×: → `Probable error` (issue: `Vendor/Provenance near-dup`). Report the less-frequent value with the canonical as suggested fix. Note: trailing-digit eBay seller variants (e.g. `mootsrarerecords` vs `mootsrarerecords2`) are common false positives here.
 
 ### Matrix-number outliers (conservative)
 
@@ -299,14 +320,14 @@ Needs `cols.SideAMatrix` and/or `cols.SideBMatrix` (runs over whichever resolved
    - The candidate format appears only 1 or 2 times in absolute terms for that label.
 4. → `Worth a look`.
 
-If this still produces many findings, tighten further (raise min-entries threshold or lower share threshold).
+Note: `?`-suffixed and bracketed (`[CA-14873-1]`) matrix numbers and semicolon-joined ones (`MB-325-3; DJ-6`) are legitimate annotation patterns and are the main source of noise here. If this still produces many findings, tighten further (raise min-entries threshold or lower share threshold).
 
 ### Hyperlink checks (`cols.DAHR_A`, `cols.DAHR_B`, `cols.Discogs`, `cols.Cat45`)
 
 Compute the column letter for each resolved hyperlink column from its index; pass that letter into `getCellProperties`. Each column is independently optional — process whichever subset resolved.
 
 - **Missing hyperlink**: cell has text but no native hyperlink → `Definite error`.
-- **Cross-copy hyperlink mismatch**: group by `(cols.Label, cols.Prefix, cols.Number, cols.Suffix)`. Within groups of 2+ copies, per column: if some have URLs and some don't, OR distinct URLs across copies → `Probable error`. Report once per group + column.
+- **Cross-copy hyperlink mismatch**: group by `(cols.Label, cols.Prefix, cols.Number, cols.Suffix)`. Within groups of 2+ copies, per column: if some have URLs and some don't, OR distinct URLs across copies → `Probable error`. Report once per group + column. Demote Franken-record collision groups to `Worth a look` (see "Franken-records").
 
 ## Extending the skill
 
@@ -321,6 +342,7 @@ When the user describes a new check:
 ## Implementation notes
 
 - **Header resolution comes first.** Every column reference in generated code goes through `cols.*` — never a literal letter or index. To go from index to letter (for `HYPERLINK` formulas and `getCellProperties` ranges), use a small helper that handles two-letter columns (`AA`–`ZZ`).
+- **Detecting a Franken-record.** The `Record` cell is a literal string (not a formula) containing a `/` that joins two `Label …Number` tokens (e.g. `Film 362/Rex 10049`). A helper `isFrankenRecord(recordValue)` tests for a slash with label-number-shaped text on both sides. Side A maps to the first record, Side B to the second. Use it to gate the Side A/B year-gap check and to demote Title cross-copy and cross-copy-hyperlink collisions.
 - **Cross-table data structures must carry source-table tags.** Any map or list that pools rows from both `Record_Collection` and `Sold` (artist near-duplicate, vendor/provenance, and any future cross-table check) must store each entry with its source table identifier (`"RC"` or `"Sold"`) alongside the row number. When looking up a row later, dispatch to the correct data array based on that tag — never assume an occurrence came from Record_Collection. Indexing `rcData[occ.row - 2]` for a Sold-table occurrence silently pulls the wrong record.
 - **Levenshtein**: small JS function with early exit when length difference > 3.
 - **Collapse function**: lowercase, then replace anything that isn't a letter or digit — strips all non-alphanumeric for similarity comparison.
